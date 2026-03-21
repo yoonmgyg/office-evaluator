@@ -26,6 +26,7 @@ participant = [
     "a2a-sdk[http-server]>=0.3.20",
     "openai>=1.50.0",
     "anthropic>=0.40.0",
+    "google-genai>=0.2.0",
 ]
 dev = [
     "mypy>=1.18.1",

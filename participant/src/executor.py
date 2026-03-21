@@ -36,6 +36,13 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 
 SYSTEM_PROMPT = """You are an advanced financial agent designed to answer complex questions about the U.S. Treasury Bulletin. You must ensure absolute numerical accuracy.
 
@@ -79,8 +86,9 @@ def execute_python_code(code: str) -> str:
 
 def get_llm_response(prompt: str) -> str:
     provider = os.environ.get("LLM_PROVIDER", "").lower()
-    use_openai = OPENAI_AVAILABLE and (provider == "openai" or (provider == "" and not os.environ.get("ANTHROPIC_API_KEY")))
-    use_anthropic = ANTHROPIC_AVAILABLE and (provider == "anthropic" or (provider == "" and not use_openai))
+    use_gemini = GEMINI_AVAILABLE and (provider == "gemini" or (provider == "" and os.environ.get("GEMINI_API_KEY")))
+    use_openai = OPENAI_AVAILABLE and (provider == "openai" or (provider == "" and not use_gemini and not os.environ.get("ANTHROPIC_API_KEY")))
+    use_anthropic = ANTHROPIC_AVAILABLE and (provider == "anthropic" or (provider == "" and not use_openai and not use_gemini))
 
     messages = [{"role": "user", "content": prompt}]
     
@@ -199,6 +207,80 @@ def get_llm_response(prompt: str) -> str:
                         })
             else:
                 return msg.content or ""
+
+    elif use_gemini:
+        client = genai.Client()
+        model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        
+        execute_python_tool = genai_types.Tool(
+            function_declarations=[
+                genai_types.FunctionDeclaration(
+                    name="execute_python",
+                    description="Execute python code to calculate math accurately.",
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={
+                            "code": genai_types.Schema(type=genai_types.Type.STRING)
+                        },
+                        required=["code"]
+                    )
+                )
+            ]
+        )
+        tools = [execute_python_tool]
+        
+        enable_web_search = os.environ.get("ENABLE_WEB_SEARCH", "false").lower() == "true"
+        if enable_web_search:
+             web_search_tool = genai_types.Tool(
+                function_declarations=[
+                    genai_types.FunctionDeclaration(
+                        name="web_search",
+                        description="AgentBeats proxy for web search."
+                    )
+                ]
+             )
+             tools.append(web_search_tool)
+             
+        chat = client.chats.create(
+            model=model,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.0,
+                tools=tools
+            )
+        )
+        
+        current_msg = prompt
+        for step in range(10):
+            response = chat.send_message(current_msg)
+            
+            if response.function_calls:
+                # We need to process the tool calls and continue the loop
+                tool_results = []
+                for fc in response.function_calls:
+                    if fc.name == "execute_python":
+                        code = fc.args.get("code", "") if fc.args else ""
+                        result = execute_python_code(code)
+                        logger.info(f"Python tool executed:\n{code}\nResult: {result}")
+                        tool_results.append(
+                            genai_types.Part.from_function_response(
+                                name="execute_python",
+                                response={"result": result[:20000]}
+                            )
+                        )
+                    elif fc.name == "web_search":
+                        logger.warning("web_search hit local eval instead of proxy.")
+                        tool_results.append(
+                            genai_types.Part.from_function_response(
+                                name="web_search",
+                                response={"result": "Web search proxy unavailable in local testing."}
+                            )
+                        )
+                
+                # Setup the message for the next iteration
+                current_msg = tool_results
+            else:
+                return response.text or ""
 
     return "<FINAL_ANSWER>Unable to determine - no LLM configured</FINAL_ANSWER>"
 
