@@ -46,8 +46,12 @@ except ImportError:
 
 SYSTEM_PROMPT = """You are an advanced financial agent designed to answer complex questions about the U.S. Treasury Bulletin. You must ensure absolute numerical accuracy.
 
-Whenever you need to calculate inflation, standard deviations, adjust for percentage changes, or perform ANY math, use the `execute_python` tool. Do NOT guess mathematical answers.
-To answer the question, you can also use `web_search` to find data from the US Treasury Bulletins if it's available.
+CRITICAL INSTRUCTION ON DATA RETRIEVAL:
+DO NOT rely on `web_search` to read PDFs or FRASER websites because you will hit the token limit and fail. 
+Instead, use your `execute_python` tool to fetch the pre-parsed dataset CSVs directly from GitHub!
+The Databricks parsed Treasury Bulletins repository is located at:
+`https://api.github.com/repos/databricks/officeqa/git/trees/6aa8c32?recursive=1`
+Use Python's `urllib.request` or `requests` module to fetch that tree, locate the specific `treasury_bulletins_parsed/` CSV or JSON files for the exact year/month you need, download them from `raw.githubusercontent.com` (example: `https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/treasury_bulletins_parsed/your_file.csv`), and load them into a `pandas` dataframe to compute the answer entirely within python memory!
 
 When you are completely finished, output your final answer as:
 <REASONING>
@@ -57,7 +61,9 @@ When you are completely finished, output your final answer as:
 [value]
 </FINAL_ANSWER>
 
-If you do not produce a <FINAL_ANSWER> tag with the exact canonical final answer enclosed, your response will be considered incorrect.
+CRITICAL INSTRUCTION ON FORMATTING: 
+The <FINAL_ANSWER> tag MUST CONTAIN EXACTLY THE FINAL STRING/VALUE EXPECTED BY THE USER PROMPT. 
+DO NOT WRITE CONVERSATIONAL ESSAYS LIKE "I apologize, but I'm unable to locate...". DO NOT INCLUDE ANY VERBOSE EXPLANATIONS OR HEDGING INSIDE THE <FINAL_ANSWER> TAG. IT MUST BE AS CONCISE AS HUMANLY POSSIBLE (e.g., highly specific strings like `"39482.03"` or `"36080 million"`). IF YOU PRODUCE CONVERSATIONAL TEXT INSIDE THE FINAL ANSWER TAG, YOU WILL AUTOMATICALLY FAIL THE BENCHMARK!
 """
 
 def execute_python_code(code: str) -> str:
@@ -107,16 +113,11 @@ def get_llm_response(prompt: str) -> str:
             }
         ]
         
-        # In competitions, this proxy tool is intercepted
-        enable_web_search = os.environ.get("ENABLE_WEB_SEARCH", "false").lower() == "true"
-        if enable_web_search:
-             tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 10})
-        
         system_prompt = SYSTEM_PROMPT
         for step in range(10):
             response = client.messages.create(
                 model=model,
-                max_tokens=8000,
+                max_tokens=4096,
                 system=system_prompt,
                 messages=messages,
                 tools=tools,
@@ -138,23 +139,11 @@ def get_llm_response(prompt: str) -> str:
                                     {
                                         "type": "tool_result",
                                         "tool_use_id": content_block.id,
-                                        "content": result[:20000]
+                                        "content": result[:10000]
                                     }
                                 ]
                             })
-                        elif content_block.name == "web_search":
-                            # If proxy fails and it hits local eval
-                            logger.warning("web_search hit local eval instead of proxy.")
-                            messages.append({
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": content_block.id,
-                                        "content": "Web search proxy unavailable in local testing."
-                                    }
-                                ]
-                            })
+
             else:
                 text_parts = [b.text for b in response.content if hasattr(b, 'text')]
                 return "\n".join(text_parts)

@@ -1,10 +1,11 @@
+# Auto-generated from scenario.toml
+
 services:
-  judge:
+  green-agent:
     image: ghcr.io/arnavsinghvi11/officeqa-judge:latest
-    container_name: officeqa-judge
-    command: ["--host", "0.0.0.0", "--port", "9009", "--card-url", "http://judge:9009"]
-    ports:
-      - 9009:9009
+    platform: linux/amd64
+    container_name: green-agent
+    command: ["--host", "0.0.0.0", "--port", "9009", "--card-url", "http://green-agent:9009"]
     environment:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
@@ -18,22 +19,19 @@ services:
       officeqa_agent:
         condition: service_healthy
     networks:
-      - agentnet
+      - agent-network
 
   officeqa_agent:
-    image: ghcr.io/arnavsinghvi11/officeqa-agent:latest
-    container_name: officeqa-agent
+    image: officeqa-purple:latest
+    platform: linux/amd64
+    container_name: officeqa_agent
     command: ["--host", "0.0.0.0", "--port", "9009", "--card-url", "http://officeqa_agent:9009"]
-    ports:
-      - 9019:9009
     environment:
       - PYTHONUNBUFFERED=1
-      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-5.2}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-opus-4-5-20251101}
-      - ENABLE_WEB_SEARCH=${ENABLE_WEB_SEARCH:-false}
+      - LLM_PROVIDER=anthropic
+      - ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+      - ENABLE_WEB_SEARCH=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9009/.well-known/agent-card.json"]
       interval: 5s
@@ -41,23 +39,24 @@ services:
       retries: 10
       start_period: 30s
     networks:
-      - agentnet
+      - agent-network
 
   agentbeats-client:
     image: ghcr.io/agentbeats/agentbeats-client:v1.0.0
+    platform: linux/amd64
     container_name: agentbeats-client
     volumes:
       - ./a2a-scenario.toml:/app/scenario.toml
       - ./output:/app/output
     command: ["scenario.toml", "output/results.json"]
     depends_on:
-      judge:
+      green-agent:
         condition: service_healthy
       officeqa_agent:
         condition: service_healthy
     networks:
-      - agentnet
+      - agent-network
 
 networks:
-  agentnet:
+  agent-network:
     driver: bridge
