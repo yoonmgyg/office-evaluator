@@ -46,23 +46,26 @@ RAW_BASE = (
 # ---------------------------------------------------------------------------
 # SYSTEM PROMPT — instructs the LLM to use the custom tools
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are an advanced financial agent designed to answer complex questions about the U.S. Treasury Bulletin. You must ensure absolute numerical accuracy.
+SYSTEM_PROMPT = """You are an advanced data synthesis agent designed to solve complex analytical questions. You must ensure absolute numerical accuracy.
 
 You have access to three tools:
 
-1. **query_treasury_corpus** — Use this FIRST to retrieve relevant Treasury Bulletin data.
-   Supply `year` (string like "1940"), `month` (string like "January" or "" for annual), and `keyword` (string to filter rows, e.g. "national defense").
-   The tool returns matching CSV rows as text. If no rows match, try broadening your keyword or checking adjacent months/years.
+1. **search_zip_corpus** — A generic RAG tool to search zipped document repositories. 
+   Use this FIRST to retrieve relevant text from the target corpus. 
+   For this specific scenario, your primary historical document corpus is located at:
+   `https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed.zip`
+   Pass this URL to the tool. Supply a `filename_filter` (like "1940" or "1953_01") and a `keyword` (like "national defense"). 
+   The tool returns matching paragraphs as text. If no exact matches are found, try broadening your keyword.
 
 2. **execute_python** — Use this for ALL math: regressions, standard deviations, geometric means, inflation adjustments, etc.
    Write complete Python scripts. Use pandas and numpy as needed — they are pre-installed.
-   You can pass the data you received from query_treasury_corpus into your Python code.
+   You can pass the data you received from your corpus search into your Python code.
 
-3. **web_search** — Use this as a LAST RESORT for data not found in the Treasury corpus (e.g., CPI-U values from FRED, exchange rates from Macrotrends, etc.).
+3. **web_search** — Use this as a LAST RESORT for external data not found in the corpus (e.g., CPI-U values from FRED, etc.).
 
 WORKFLOW:
 1. Analyze the question to identify the year(s), month(s), and category/keyword.
-2. Call query_treasury_corpus to retrieve the relevant data rows.
+2. Call search_zip_corpus to retrieve the relevant data paragraphs.
 3. If the data needs math, call execute_python with the retrieved values.
 4. Output your final answer.
 
@@ -84,16 +87,34 @@ CRITICAL FORMATTING RULES:
 """
 
 # ---------------------------------------------------------------------------
-# Tool 1: Treasury Corpus RAG — dynamic GitHub fetching + pandas filtering
+# Tool 1: Treasury Corpus RAG — dynamic zip fetching + paragraph filtering
 # ---------------------------------------------------------------------------
-_tree_cache = None
+_corpus_cache = None
 
-def _get_corpus_tree():
-    """Fetch and cache the GitHub tree listing of all parsed Treasury files."""
-    global _tree_cache
-    if _tree_cache is not None:
-        return _tree_cache
+def _get_corpus_cache():
+    """Fetch and cache the transformed zip containing 697 text documents."""
+    global _corpus_cache
+    if _corpus_cache is not None:
+        return _corpus_cache
     
+    import requests, zipfile, io
+    zip_url = "https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed.zip"
+    try:
+        logger.info("Downloading transformed corpus zip from GitHub...")
+        resp = requests.get(zip_url, timeout=60)
+        resp.raise_for_status()
+        
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            _corpus_cache = {}
+            for fname in z.namelist():
+                if fname.endswith(".txt"):
+                    _corpus_cache[fname] = z.read(fname).decode("utf-8", errors="replace")
+        
+        logger.info(f"Loaded {len(_corpus_cache)} documents into memory.")
+        return _corpus_cache
+    except Exception as e:
+        logger.error(f"Failed to fetch corpus zip: {e}")
+        return {}    
     import requests
     try:
         resp = requests.get(GITHUB_TREE_URL, timeout=30)
@@ -114,112 +135,81 @@ def _get_corpus_tree():
         return []
 
 
-def _find_matching_files(year: str, month: str, paths: list) -> list:
-    """Find files in the corpus that match the given year and optionally month."""
-    year = year.strip().lower()
-    month = month.strip().lower() if month else ""
+def _find_matching_filenames(year: str, month: str, filenames: list) -> list:
+    """Find files in the cache matching the year and month."""
+    year = year.strip()
+    month = month.strip().lower()
     
-    matches = []
-    for p in paths:
-        p_lower = p.lower()
-        if year in p_lower:
-            if month:
-                if month in p_lower:
-                    matches.append(p)
-            else:
-                matches.append(p)
-    
-    # If too many matches, prefer CSV files
-    if len(matches) > 20:
-        csv_matches = [m for m in matches if m.endswith('.csv')]
-        if csv_matches:
-            matches = csv_matches[:20]
-        else:
-            matches = matches[:20]
-    
-    return matches
+    # Map text month to numeric 01-12 if needed (filenames are formatted like treasury_bulletin_1940_01.txt)
+    month_mapping = {
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12",
+        "jan": "01", "feb": "02", "mar": "03", "apr": "04", "jun": "06",
+        "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"
+    }
+    month_num = month_mapping.get(month, month) if month else ""
 
+    matches = []
+    for fname in filenames:
+        if year in fname:
+            if month_num:
+                if f"_{month_num}.txt" in fname or f"_{month_num}_" in fname:
+                    matches.append(fname)
+            else:
+                matches.append(fname)
+    
+    return sorted(matches)
 
 def query_treasury_corpus(year: str, month: str = "", keyword: str = "") -> str:
     """
-    Dynamically fetch parsed Treasury Bulletin data from the Databricks GitHub repo.
-    Filters rows by keyword and returns concise text to the LLM.
+    Search the in-memory zipped corpus for matching files, then extract
+    paragraphs or lines containing the specific keyword.
     """
-    import requests
-    import io
+    corpus = _get_corpus_cache()
+    if not corpus:
+        return "Error: Could not retrieve corpus from GitHub."
     
-    paths = _get_corpus_tree()
-    if not paths:
-        return "Error: Could not fetch corpus file listing from GitHub."
-    
-    matching_files = _find_matching_files(year, month, paths)
+    matching_files = _find_matching_filenames(year, month, list(corpus.keys()))
+    if not matching_files and month:
+        # Try without month if no files found
+        matching_files = _find_matching_filenames(year, "", list(corpus.keys()))
+        
     if not matching_files:
-        # Try without month
-        matching_files = _find_matching_files(year, "", paths)
-    
-    if not matching_files:
-        return f"No files found for year={year}, month={month}. Available years in corpus: try browsing with execute_python."
+        return f"No documents found for year={year}. Please check if data is available."
     
     results = []
     keyword_lower = keyword.strip().lower() if keyword else ""
     
-    for fpath in matching_files[:5]:  # Limit to 5 files to control token usage
-        url = RAW_BASE + fpath
-        try:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            content = resp.text
+    for fname in matching_files[:12]:  # Limit to 12 documents to prevent explosion
+        content = corpus[fname]
+        if not keyword_lower:
+            results.append(f"--- {fname} ---\n{content[:1500]}... [Truncated. Provider a keyword to filter.]")
+            continue
             
-            fname = fpath.split("/")[-1]
-            
-            if fpath.endswith(".csv"):
-                try:
-                    import pandas as pd
-                    df = pd.read_csv(io.StringIO(content))
-                    
-                    if keyword_lower and len(df) > 0:
-                        # Filter rows where any column contains the keyword
-                        mask = df.apply(
-                            lambda row: any(
-                                keyword_lower in str(v).lower() for v in row
-                            ),
-                            axis=1,
-                        )
-                        filtered = df[mask]
-                        if len(filtered) > 0:
-                            # Return filtered rows as compact string
-                            result_str = f"\n--- {fname} (filtered by '{keyword}') ---\n"
-                            result_str += f"Columns: {list(df.columns)}\n"
-                            result_str += filtered.head(50).to_string(index=False)
-                            results.append(result_str)
-                        else:
-                            # Return column names and first few rows as context
-                            result_str = f"\n--- {fname} (no rows match '{keyword}', showing headers + sample) ---\n"
-                            result_str += f"Columns: {list(df.columns)}\n"
-                            result_str += df.head(5).to_string(index=False)
-                            results.append(result_str)
-                    else:
-                        # No keyword filter — return structure + sample
-                        result_str = f"\n--- {fname} ---\n"
-                        result_str += f"Shape: {df.shape}, Columns: {list(df.columns)}\n"
-                        result_str += df.head(20).to_string(index=False)
-                        results.append(result_str)
-                except Exception as e:
-                    results.append(f"\n--- {fname} (CSV parse error: {e}) ---")
-            else:
-                # For non-CSV (text/json), return a truncated snippet
-                snippet = content[:3000]
-                results.append(f"\n--- {fname} ---\n{snippet}")
-        except Exception as e:
-            results.append(f"\n--- {fpath} (fetch error: {e}) ---")
+        # Split by empty lines to get paragraphs
+        paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+        matching_paras = [p for p in paragraphs if keyword_lower in p.lower()]
+        
+        if matching_paras:
+            results.append(f"--- {fname} (filtered for '{keyword}') ---")
+            for p in matching_paras[:10]: # Max 10 paragraphs per file
+                results.append(p)
+        else:
+            # Fallback to line-by-line search if no paragraph splitting matches
+            lines = [line.strip() for line in content.split("\n") if line.strip()]
+            matching_lines = [line for line in lines if keyword_lower in line.lower()]
+            if matching_lines:
+                results.append(f"--- {fname} (filtered lines for '{keyword}') ---")
+                results.extend(matching_lines[:20]) # Max 20 lines per file
     
     if not results:
-        return f"Found {len(matching_files)} files but could not extract data."
-    
+        found_names = ", ".join(matching_files[:5])
+        return f"Found documents ({found_names}) but none contained the keyword '{keyword}'."
+        
     output = "\n".join(results)
-    # Hard cap to prevent token explosion
     if len(output) > 8000:
-        output = output[:8000] + "\n... [truncated]"
+        return output[:8000] + "\n... [Output truncated to 8000 chars]"
     return output
 
 
@@ -296,12 +286,12 @@ def dispatch_tool(tool_name: str, tool_input: dict) -> str:
         logger.info(f"execute_python:\n{code}\nResult: {result[:500]}")
         return result[:10000]
     
-    elif tool_name == "query_treasury_corpus":
-        year = tool_input.get("year", "")
-        month = tool_input.get("month", "")
+    elif tool_name == "search_zip_corpus":
+        zip_url = tool_input.get("zip_url", "")
+        filename_filter = tool_input.get("filename_filter", "")
         keyword = tool_input.get("keyword", "")
-        result = query_treasury_corpus(year, month, keyword)
-        logger.info(f"query_treasury_corpus(year={year}, month={month}, keyword={keyword}): {len(result)} chars")
+        result = search_zip_corpus(zip_url, filename_filter, keyword)
+        logger.info(f"search_zip_corpus(filter={filename_filter}, keyword={keyword}): {len(result)} chars")
         return result
     
     elif tool_name == "web_search":
@@ -325,29 +315,30 @@ def get_llm_response(prompt: str) -> str:
     # Register all three tools with Claude
     tools = [
         {
-            "name": "query_treasury_corpus",
+            "name": "search_zip_corpus",
             "description": (
-                "Retrieve parsed U.S. Treasury Bulletin data for a specific year and optional month. "
-                "Returns matching CSV rows filtered by keyword. Use this FIRST to find financial data "
-                "before doing any calculations. The corpus contains 697 parsed bulletin documents."
+                "A perfectly general RAG tool to dynamically fetch and search a compressed corpus of files. "
+                "Downloads a remote ZIP file containing text, json, or csv files into memory. "
+                "You can optionally filter which files to search using filename_filter. "
+                "Returns ONLY the paragraphs or lines matching your keyword to save tokens."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "year": {
+                    "zip_url": {
                         "type": "string",
-                        "description": "The year to search for, e.g. '1940' or '1981'"
+                        "description": "The exact URL of the .zip file containing the corpus."
                     },
-                    "month": {
+                    "filename_filter": {
                         "type": "string",
-                        "description": "Optional month name, e.g. 'January', 'March'. Leave empty for annual data."
+                        "description": "Optional substring to filter files (e.g., '1940' or '1953_01')."
                     },
                     "keyword": {
                         "type": "string",
-                        "description": "Keyword to filter rows, e.g. 'national defense', 'customs', 'interest'. Case-insensitive."
+                        "description": "Keyword to extract relevant paragraphs from the files. Case-insensitive."
                     }
                 },
-                "required": ["year"]
+                "required": ["zip_url"]
             }
         },
         {
