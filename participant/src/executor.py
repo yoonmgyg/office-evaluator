@@ -54,13 +54,15 @@ You have access to three tools:
 2. **execute_python** — Use this for ALL math: regressions, standard deviations, geometric means, inflation adjustments, etc.
    Write complete Python scripts. Use pandas and numpy as needed — they are pre-installed.
    You can pass the data you received from your corpus search into your Python code.
+   CRITICAL: When summing tabular data, BEWARE OF DOUBLE COUNTING! Tables often include both a "Total" row and sub-category rows. Do not sum a "Total" row with its sub-components!
+   NOTE: If you need inflation data (like historical CPI-U), you MUST write a python script using `requests` and `bs4` to scrape it, as the web_search tool is disabled!
 
-3. **web_search** — Use this as a LAST RESORT for external data not found in the corpus (e.g., CPI-U values from FRED, etc.).
+3. **web_search** — Use this as a LAST RESORT for external data not found in the corpus.
 
 WORKFLOW:
 1. Analyze the question to identify the year(s), month(s), and category/keyword.
-2. Call search_zip_corpus to retrieve the relevant data paragraphs. Keep keywords SHORT.
-3. If the data needs math, call execute_python with the retrieved values.
+2. Call search_zip_corpus to retrieve the relevant datasets natively within the context.
+3. If the data needs math, call execute_python.
 4. Output your final answer.
 
 When you are completely finished, output your final answer as:
@@ -83,7 +85,6 @@ CRITICAL FORMATTING RULES:
 _corpus_caches = {}
 
 def _get_corpus_cache(zip_url: str):
-    """Fetch and cache a zip file containing text documents into memory."""
     global _corpus_caches
     if zip_url in _corpus_caches:
         return _corpus_caches[zip_url]
@@ -108,7 +109,6 @@ def _get_corpus_cache(zip_url: str):
         return {}
 
 def _find_matching_filenames(filter_str: str, filenames: list) -> list:
-    """Find files in the cache matching the filter string."""
     filter_str = filter_str.strip().lower()
     if not filter_str:
         return filenames
@@ -117,10 +117,6 @@ def _find_matching_filenames(filter_str: str, filenames: list) -> list:
     return sorted(matches)
 
 def search_zip_corpus(zip_url: str, filename_filter: str = "", keyword: str = "") -> str:
-    """
-    Search an in-memory zipped corpus for matching files, then extract
-    paragraphs or lines containing the specific keyword.
-    """
     corpus = _get_corpus_cache(zip_url)
     if not corpus:
         return f"Error: Could not retrieve or extract corpus from {zip_url}."
@@ -133,34 +129,33 @@ def search_zip_corpus(zip_url: str, filename_filter: str = "", keyword: str = ""
     results = []
     keyword_words = keyword.strip().lower().split() if keyword else []
     
-    for fname in matching_files[:12]:  # Limit to 12 documents to prevent explosion
+    for fname in matching_files[:12]:
         content = corpus[fname]
         if not keyword_words:
-            results.append(f"--- {fname} ---\n{content[:1500]}... [Truncated. Provide a keyword to filter.]")
+            results.append(f"--- {fname} ---\n{content[:4000]}... [Truncated. Provide a keyword to filter.]")
             continue
             
         paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-        # Match if ALL words in the keyword exist in the paragraph
         matching_paras = [p for p in paragraphs if all(w in p.lower() for w in keyword_words)]
         
         if matching_paras:
             results.append(f"--- {fname} (filtered for '{keyword}') ---")
-            for p in matching_paras[:10]: # Max 10 paragraphs per file
+            for p in matching_paras[:50]:
                 results.append(p)
         else:
             lines = [line.strip() for line in content.split("\n") if line.strip()]
             matching_lines = [line for line in lines if all(w in line.lower() for w in keyword_words)]
             if matching_lines:
                 results.append(f"--- {fname} (filtered lines for '{keyword}') ---")
-                results.extend(matching_lines[:20]) # Max 20 lines per file
+                results.extend(matching_lines[:300])
     
     if not results:
         found_names = ", ".join(matching_files[:5])
         return f"Found documents ({found_names}) but none contained the keyword '{keyword}'."
         
     output = "\n".join(results)
-    if len(output) > 8000:
-        return output[:8000] + "\n... [Output truncated to 8000 chars]"
+    if len(output) > 80000:
+        return output[:80000] + "\n... [Output truncated to 80000 chars]"
     return output
 
 
@@ -190,21 +185,14 @@ def execute_python_code(code: str) -> str:
 
 
 def web_search_local(query: str) -> str:
-    """Fallback web search — in local testing this returns a stub."""
     logger.warning(f"web_search called locally with query: {query}")
     return "Web search proxy unavailable in local testing. Use query_treasury_corpus or execute_python instead."
 
 
 def extract_final_answer(response_text: str) -> str:
-    """
-    Extract ONLY the content inside <FINAL_ANSWER>...</FINAL_ANSWER> tags.
-    Strips all conversational padding and wraps it securely back in tags 
-    for the AgentBeats judge to parse.
-    """
     match = re.search(r"<FINAL_ANSWER>(.*?)</FINAL_ANSWER>", response_text, re.DOTALL)
     if match:
         answer = match.group(1).strip()
-        # Additional cleanup: remove common conversational prefixes
         prefixes_to_strip = [
             "The answer is ", "The answer is: ", "Answer: ",
             "The value is ", "The result is ", "Result: ",
@@ -214,8 +202,6 @@ def extract_final_answer(response_text: str) -> str:
                 answer = answer[len(prefix):].strip()
         return f"<FINAL_ANSWER>\n{answer}\n</FINAL_ANSWER>"
     
-    # No FINAL_ANSWER tags found — wrap whatever they gave us to prevent auto-failure
-    # unless it's a massive essay.
     if len(response_text.split()) < 20:
         return f"<FINAL_ANSWER>\n{response_text.strip()}\n</FINAL_ANSWER>"
         
@@ -223,7 +209,6 @@ def extract_final_answer(response_text: str) -> str:
 
 
 def dispatch_tool(tool_name: str, tool_input: dict) -> str:
-    """Route a tool call to the appropriate handler."""
     if tool_name == "execute_python":
         code = tool_input.get("code", "")
         result = execute_python_code(code)
@@ -253,7 +238,6 @@ def get_llm_response(prompt: str) -> str:
     client = anthropic.Anthropic()
     model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     
-    # Register all three tools with Claude
     tools = [
         {
             "name": "search_zip_corpus",
@@ -302,14 +286,12 @@ def get_llm_response(prompt: str) -> str:
         },
     ]
     
-    # Optionally add web_search (proxied by AgentBeats in competition)
     enable_web_search = os.environ.get("ENABLE_WEB_SEARCH", "false").lower() == "true"
     if enable_web_search:
         tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 5})
     
     messages = [{"role": "user", "content": prompt}]
     
-    # Agentic loop — up to 15 iterations of tool use
     for step in range(15):
         try:
             response = client.messages.create(
@@ -324,102 +306,73 @@ def get_llm_response(prompt: str) -> str:
             logger.error(f"Anthropic API error on step {step}: {e}")
             if "rate_limit" in str(e).lower() or "429" in str(e):
                 import time
-                time.sleep(5)  # Brief backoff for rate limits
+                wait_time = min(60, 2 ** step)
+                logger.info(f"Retrying request to /v1/messages in {wait_time:.6f} seconds")
+                time.sleep(wait_time)
                 continue
-            return f"<FINAL_ANSWER>Error: {e}</FINAL_ANSWER>"
+            else:
+                return f"Error: API failure: {e}"
         
-        messages.append({"role": "assistant", "content": response.content})
+        for block in response.content:
+            if block.type == "tool_use":
+                logger.info(f"Claude requested tool {block.name} with {block.input}")
+                
+                result = dispatch_tool(block.name, block.input)
+                
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        }
+                    ],
+                })
         
-        if response.stop_reason == "tool_use":
-            tool_results = []
+        if response.stop_reason == "end_turn":
             for block in response.content:
-                if block.type == "tool_use":
-                    result = dispatch_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            # End of generation — extract text and enforce formatting
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            raw_response = "\n".join(text_parts)
+                if block.type == "text" and "<FINAL_ANSWER>" in block.text:
+                    logger.info(f"Final answer extracted:\n{block.text}")
+                    return extract_final_answer(block.text)
             
-            # Apply strict regex enforcer
-            final_answer = extract_final_answer(raw_response)
-            logger.info(f"Final answer extracted: {final_answer[:200]}")
-            return final_answer
-    
-    return "<FINAL_ANSWER>Error: max tool iterations reached</FINAL_ANSWER>"
+            non_empty_texts = [b.text for b in response.content if b.type == "text" and b.text.strip()]
+            if non_empty_texts:
+                return extract_final_answer(non_empty_texts[-1])
+            return "Error: Empty response"
+
+    return "Error: max tool iterations reached"
 
 
 class Executor(AgentExecutor):
-    def __init__(self):
-        self._contexts: dict[str, list[dict]] = {}
-
-    async def execute(
-        self,
-        context: RequestContext,
-        event_queue: EventQueue,
-    ) -> None:
-        message = context.message
-        if not message or not message.parts:
-            logger.warning("Received empty message")
-            return
-
-        task = context.current_task
-        if task and task.status.state in TERMINAL_STATES:
-            logger.info(f"Task {task.id} already in terminal state")
-            return
-
-        task_id = context.task_id or "unknown"
-        context_id = context.context_id or "unknown"
-
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                taskId=task_id,
-                contextId=context_id,
-                status=TaskStatus(
-                    state=TaskState.working,
-                    message=Message(
-                        messageId=uuid4().hex,
-                        role="agent",
-                        parts=[Part(root=TextPart(kind="text", text="Processing question..."))],
-                    ),
-                ),
-                final=False,
-            )
-        )
-
-        question_text = ""
-        for part in message.parts:
-            root = part.root if hasattr(part, 'root') else part
-            if isinstance(root, TextPart):
-                question_text = root.text
-                break
-
+    async def process_task(self, context: RequestContext, queue: EventQueue):
+        logger.info(f"Processing task {context.task_id}...")
         try:
-            response = await asyncio.to_thread(get_llm_response, question_text)
-        except Exception as e:
-            logger.exception(f"LLM call failed: {e}")
-            response = f"Error: {e}"
-
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                taskId=task_id,
-                contextId=context_id,
-                status=TaskStatus(
-                    state=TaskState.completed,
-                    message=Message(
-                        messageId=uuid4().hex,
-                        role="agent",
-                        parts=[Part(root=TextPart(kind="text", text=response))],
-                    ),
-                ),
-                final=True,
+            prompt = ""
+            for msg in context.messages:
+                for part in msg.parts:
+                    if isinstance(part, TextPart):
+                        prompt += part.text + "\n"
+            
+            final_answer = get_llm_response(prompt)
+            
+            await queue.put(
+                TaskStatusUpdateEvent(
+                    status=TaskStatus(
+                        state=TaskState.completed,
+                        messages=[Message(role="assistant", parts=[TextPart(text=final_answer)])]
+                    )
+                )
             )
-        )
-
-    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        raise UnsupportedOperationError(message="Cancellation not supported")
+            
+        except Exception as e:
+            logger.error(f"Task failed: {str(e)}", exc_info=True)
+            await queue.put(
+                TaskStatusUpdateEvent(
+                    status=TaskStatus(
+                        state=TaskState.failed,
+                        messages=[Message(role="assistant", parts=[TextPart(text=f"Task failed: {str(e)}")])]
+                    )
+                )
+            )
