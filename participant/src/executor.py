@@ -33,9 +33,6 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 GITHUB_TREE_URL = (
     "https://api.github.com/repos/databricks/officeqa/git/trees/6aa8c32?recursive=1"
 )
@@ -43,9 +40,6 @@ RAW_BASE = (
     "https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/"
 )
 
-# ---------------------------------------------------------------------------
-# SYSTEM PROMPT — instructs the LLM to use the custom tools
-# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """You are an advanced data synthesis agent designed to solve complex analytical questions. You must ensure absolute numerical accuracy.
 
 You have access to three tools:
@@ -54,8 +48,8 @@ You have access to three tools:
    Use this FIRST to retrieve relevant text from the target corpus. 
    For this specific scenario, your primary historical document corpus is located at:
    `https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed.zip`
-   Pass this URL to the tool. Supply a `filename_filter` (like "1940" or "1953_01") and a `keyword` (like "national defense"). 
-   The tool returns matching paragraphs as text. If no exact matches are found, try broadening your keyword.
+   Pass this URL to the tool. Supply a `filename_filter` (like "1940" or "1953_01").
+   CRITICAL: Use ONLY short, single-word keywords (like "defense" or "veterans") because the tool filters paragraphs that contain all your words. Long queries will fail!
 
 2. **execute_python** — Use this for ALL math: regressions, standard deviations, geometric means, inflation adjustments, etc.
    Write complete Python scripts. Use pandas and numpy as needed — they are pre-installed.
@@ -65,7 +59,7 @@ You have access to three tools:
 
 WORKFLOW:
 1. Analyze the question to identify the year(s), month(s), and category/keyword.
-2. Call search_zip_corpus to retrieve the relevant data paragraphs.
+2. Call search_zip_corpus to retrieve the relevant data paragraphs. Keep keywords SHORT.
 3. If the data needs math, call execute_python with the retrieved values.
 4. Output your final answer.
 
@@ -86,119 +80,76 @@ CRITICAL FORMATTING RULES:
 - ANY conversational text inside <FINAL_ANSWER> will cause AUTO-FAILURE.
 """
 
-# ---------------------------------------------------------------------------
-# Tool 1: Treasury Corpus RAG — dynamic zip fetching + paragraph filtering
-# ---------------------------------------------------------------------------
-_corpus_cache = None
+_corpus_caches = {}
 
-def _get_corpus_cache():
-    """Fetch and cache the transformed zip containing 697 text documents."""
-    global _corpus_cache
-    if _corpus_cache is not None:
-        return _corpus_cache
+def _get_corpus_cache(zip_url: str):
+    """Fetch and cache a zip file containing text documents into memory."""
+    global _corpus_caches
+    if zip_url in _corpus_caches:
+        return _corpus_caches[zip_url]
     
     import requests, zipfile, io
-    zip_url = "https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed.zip"
     try:
-        logger.info("Downloading transformed corpus zip from GitHub...")
+        logger.info(f"Downloading corpus zip from {zip_url}...")
         resp = requests.get(zip_url, timeout=60)
         resp.raise_for_status()
         
+        cache = {}
         with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-            _corpus_cache = {}
             for fname in z.namelist():
-                if fname.endswith(".txt"):
-                    _corpus_cache[fname] = z.read(fname).decode("utf-8", errors="replace")
+                if fname.endswith(".txt") or fname.endswith(".json") or fname.endswith(".csv"):
+                    cache[fname] = z.read(fname).decode("utf-8", errors="replace")
         
-        logger.info(f"Loaded {len(_corpus_cache)} documents into memory.")
-        return _corpus_cache
+        logger.info(f"Loaded {len(cache)} documents into memory from {zip_url}.")
+        _corpus_caches[zip_url] = cache
+        return cache
     except Exception as e:
         logger.error(f"Failed to fetch corpus zip: {e}")
-        return {}    
-    import requests
-    try:
-        resp = requests.get(GITHUB_TREE_URL, timeout=30)
-        resp.raise_for_status()
-        tree_data = resp.json()
-        # Extract just the paths under treasury_bulletins_parsed/
-        paths = [
-            item["path"]
-            for item in tree_data.get("tree", [])
-            if item["path"].startswith("treasury_bulletins_parsed/")
-            and item["type"] == "blob"
-        ]
-        _tree_cache = paths
-        logger.info(f"Loaded corpus tree with {len(paths)} files.")
-        return paths
-    except Exception as e:
-        logger.error(f"Failed to fetch corpus tree: {e}")
-        return []
+        return {}
 
-
-def _find_matching_filenames(year: str, month: str, filenames: list) -> list:
-    """Find files in the cache matching the year and month."""
-    year = year.strip()
-    month = month.strip().lower()
+def _find_matching_filenames(filter_str: str, filenames: list) -> list:
+    """Find files in the cache matching the filter string."""
+    filter_str = filter_str.strip().lower()
+    if not filter_str:
+        return filenames
     
-    # Map text month to numeric 01-12 if needed (filenames are formatted like treasury_bulletin_1940_01.txt)
-    month_mapping = {
-        "january": "01", "february": "02", "march": "03", "april": "04",
-        "may": "05", "june": "06", "july": "07", "august": "08",
-        "september": "09", "october": "10", "november": "11", "december": "12",
-        "jan": "01", "feb": "02", "mar": "03", "apr": "04", "jun": "06",
-        "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"
-    }
-    month_num = month_mapping.get(month, month) if month else ""
-
-    matches = []
-    for fname in filenames:
-        if year in fname:
-            if month_num:
-                if f"_{month_num}.txt" in fname or f"_{month_num}_" in fname:
-                    matches.append(fname)
-            else:
-                matches.append(fname)
-    
+    matches = [fname for fname in filenames if filter_str in fname.lower()]
     return sorted(matches)
 
-def query_treasury_corpus(year: str, month: str = "", keyword: str = "") -> str:
+def search_zip_corpus(zip_url: str, filename_filter: str = "", keyword: str = "") -> str:
     """
-    Search the in-memory zipped corpus for matching files, then extract
+    Search an in-memory zipped corpus for matching files, then extract
     paragraphs or lines containing the specific keyword.
     """
-    corpus = _get_corpus_cache()
+    corpus = _get_corpus_cache(zip_url)
     if not corpus:
-        return "Error: Could not retrieve corpus from GitHub."
+        return f"Error: Could not retrieve or extract corpus from {zip_url}."
     
-    matching_files = _find_matching_filenames(year, month, list(corpus.keys()))
-    if not matching_files and month:
-        # Try without month if no files found
-        matching_files = _find_matching_filenames(year, "", list(corpus.keys()))
-        
+    matching_files = _find_matching_filenames(filename_filter, list(corpus.keys()))
+    
     if not matching_files:
-        return f"No documents found for year={year}. Please check if data is available."
+        return f"No documents found for filter='{filename_filter}'. Available files: {list(corpus.keys())[:5]}..."
     
     results = []
-    keyword_lower = keyword.strip().lower() if keyword else ""
+    keyword_words = keyword.strip().lower().split() if keyword else []
     
     for fname in matching_files[:12]:  # Limit to 12 documents to prevent explosion
         content = corpus[fname]
-        if not keyword_lower:
-            results.append(f"--- {fname} ---\n{content[:1500]}... [Truncated. Provider a keyword to filter.]")
+        if not keyword_words:
+            results.append(f"--- {fname} ---\n{content[:1500]}... [Truncated. Provide a keyword to filter.]")
             continue
             
-        # Split by empty lines to get paragraphs
         paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-        matching_paras = [p for p in paragraphs if keyword_lower in p.lower()]
+        # Match if ALL words in the keyword exist in the paragraph
+        matching_paras = [p for p in paragraphs if all(w in p.lower() for w in keyword_words)]
         
         if matching_paras:
             results.append(f"--- {fname} (filtered for '{keyword}') ---")
             for p in matching_paras[:10]: # Max 10 paragraphs per file
                 results.append(p)
         else:
-            # Fallback to line-by-line search if no paragraph splitting matches
             lines = [line.strip() for line in content.split("\n") if line.strip()]
-            matching_lines = [line for line in lines if keyword_lower in line.lower()]
+            matching_lines = [line for line in lines if all(w in line.lower() for w in keyword_words)]
             if matching_lines:
                 results.append(f"--- {fname} (filtered lines for '{keyword}') ---")
                 results.extend(matching_lines[:20]) # Max 20 lines per file
@@ -213,9 +164,6 @@ def query_treasury_corpus(year: str, month: str = "", keyword: str = "") -> str:
     return output
 
 
-# ---------------------------------------------------------------------------
-# Tool 2: Execute Python — for all math/computation
-# ---------------------------------------------------------------------------
 def execute_python_code(code: str) -> str:
     import sys, io, ast, traceback
     old_stdout = sys.stdout
@@ -241,22 +189,17 @@ def execute_python_code(code: str) -> str:
         sys.stdout = old_stdout
 
 
-# ---------------------------------------------------------------------------
-# Tool 3: Web search (proxy) — last resort for external data
-# ---------------------------------------------------------------------------
 def web_search_local(query: str) -> str:
     """Fallback web search — in local testing this returns a stub."""
     logger.warning(f"web_search called locally with query: {query}")
     return "Web search proxy unavailable in local testing. Use query_treasury_corpus or execute_python instead."
 
 
-# ---------------------------------------------------------------------------
-# Strict Regex Output Enforcer
-# ---------------------------------------------------------------------------
 def extract_final_answer(response_text: str) -> str:
     """
     Extract ONLY the content inside <FINAL_ANSWER>...</FINAL_ANSWER> tags.
-    Strips all conversational padding. Falls back to raw response if no tags found.
+    Strips all conversational padding and wraps it securely back in tags 
+    for the AgentBeats judge to parse.
     """
     match = re.search(r"<FINAL_ANSWER>(.*?)</FINAL_ANSWER>", response_text, re.DOTALL)
     if match:
@@ -269,15 +212,16 @@ def extract_final_answer(response_text: str) -> str:
         for prefix in prefixes_to_strip:
             if answer.lower().startswith(prefix.lower()):
                 answer = answer[len(prefix):].strip()
-        return answer
+        return f"<FINAL_ANSWER>\n{answer}\n</FINAL_ANSWER>"
     
-    # No FINAL_ANSWER tags found — return the response as-is (the framework will handle it)
+    # No FINAL_ANSWER tags found — wrap whatever they gave us to prevent auto-failure
+    # unless it's a massive essay.
+    if len(response_text.split()) < 20:
+        return f"<FINAL_ANSWER>\n{response_text.strip()}\n</FINAL_ANSWER>"
+        
     return response_text
 
 
-# ---------------------------------------------------------------------------
-# Dispatch tool calls
-# ---------------------------------------------------------------------------
 def dispatch_tool(tool_name: str, tool_input: dict) -> str:
     """Route a tool call to the appropriate handler."""
     if tool_name == "execute_python":
@@ -302,9 +246,6 @@ def dispatch_tool(tool_name: str, tool_input: dict) -> str:
         return f"Unknown tool: {tool_name}"
 
 
-# ---------------------------------------------------------------------------
-# Main LLM response function
-# ---------------------------------------------------------------------------
 def get_llm_response(prompt: str) -> str:
     if not ANTHROPIC_AVAILABLE:
         return "<FINAL_ANSWER>Error: Anthropic SDK not available</FINAL_ANSWER>"
@@ -413,9 +354,6 @@ def get_llm_response(prompt: str) -> str:
     return "<FINAL_ANSWER>Error: max tool iterations reached</FINAL_ANSWER>"
 
 
-# ---------------------------------------------------------------------------
-# A2A Executor class (unchanged interface)
-# ---------------------------------------------------------------------------
 class Executor(AgentExecutor):
     def __init__(self):
         self._contexts: dict[str, list[dict]] = {}
