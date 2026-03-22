@@ -2,8 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y curl unzip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl unzip wget && rm -rf /var/lib/apt/lists/*
 
+RUN wget -qO /app/treasury_bulletins_transformed.zip https://raw.githubusercontent.com/databricks/officeqa/6aa8c32/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed.zip
 
 RUN pip install --no-cache-dir \
     "a2a-sdk[http-server]>=0.3.20" \
